@@ -1,0 +1,40 @@
+# === Model weights (too large for git, released checkpoints go here) ===
+*.pth
+*.pt
+*.ckpt
+
+# === Processed dataset caches & raw data archives ===
+*.pkl
+*.tar.gz
+*.zip
+data/raw/
+data/dendrite/processed_datasets/
+
+# === Training outputs & checkpoints ===
+work_dir/
+experiment/GraPHFormer-main/work_dir/
+experiment/GraPHFormer-main/checkpoints/
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# === IDE / OS ===
+.vscode/
+.idea/
+.trae/
+.DS_Store
+Thumbs.db
+
+# === Generated PDFs (can be re-produced from md) ===
+*.pdf
+
+# === Jupyter ===
+.ipynb_checkpoints/
+
+# === Temporary scripts I dropped in during debugging ===
+experiment/GraPHFormer-main/work_dir/*.py
+experiment/GraPHFormer-main/work_dir/*.log

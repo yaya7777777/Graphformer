@@ -1,0 +1,49 @@
+{
+  "repo_root": ".",
+  "python": "python",
+  "data_dir": "data/dendrite/all_eswc_soma0_ssl",
+  "dataset": "JM",
+  "work_dir": "cv_work",
+  "output_dir": "cv_results",
+  "gpu": 0,
+  "seeds": [42, 43, 44, 45, 46],
+  "folds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "tree_model": "double",
+  "child_mode": "sum",
+  "input_features": [2, 3, 4, 12, 13],
+  "h_size": 256,
+  "image_encoder": "dinov2_vits14",
+  "image_size": 112,
+  "embed_dim": 128,
+  "temperature": 0.07,
+  "sigma_px": 16,
+  "pretraining": {
+    "batch_size": 128,
+    "epochs": 300,
+    "learning_rate": 0.0005,
+    "weight_decay": 0.05,
+    "warmup_epochs": 20,
+    "val_freq": 5
+  },
+  "finetune": {
+    "batch_size": 8,
+    "epochs": 20,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.05,
+    "num_workers": 0,
+    "early_stopping_patience": 0
+  },
+  "experiments": {
+    "pretraining_conditions": ["contrastive", "no_pretraining"],
+    "modalities": ["tree_only", "image_only", "multimodal_concat", "multimodal_add"],
+    "persistence": [
+      {"name": "paper_rgb", "filters": "f1,f2,f3", "weights": "ones,persistence,radius"},
+      {"name": "f1_only", "filters": "f1", "weights": "ones"},
+      {"name": "f2_only", "filters": "f2", "weights": "persistence"},
+      {"name": "f3_only", "filters": "f3", "weights": "radius"},
+      {"name": "all_persistence", "filters": "f1,f2,f3", "weights": "persistence"},
+      {"name": "all_radius", "filters": "f1,f2,f3", "weights": "radius"},
+      {"name": "all_ones", "filters": "f1,f2,f3", "weights": "ones"}
+    ]
+  }
+}

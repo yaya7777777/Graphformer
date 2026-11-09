@@ -1,0 +1,725 @@
+"""
+GraPHFormer Fine-tuning Script
+
+Fine-tune pretrained CLIP-style models for classification.
+Supports: image_only, tree_only, multimodal modes.
+
+Usage:
+    python finetune.py --exp_name my_finetune --pretrained_checkpoint path/to/checkpoint.pth
+"""
+
+import argparse
+import datetime
+import time
+import os
+import json
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.backends.cudnn as cudnn
+from torch.utils.data import DataLoader
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import f1_score, balanced_accuracy_score
+
+from graphformer.models import CLIPModel, FineTuneModel
+from graphformer.augmentations import (
+    Compose,
+    RandomScaleCoords, RandomRotate, RandomJitter, RandomShift,
+    RandomFlip, RandomMaskFeats, RandomJitterLength, RandomElasticate,
+    RandomDropSubTrees, RandomSkipParentNode, RandomSwapSiblingSubTrees,
+    CombinedPersistenceAugmentation,
+)
+from graphformer.utils import save_checkpoint, get_root_logger, set_seed
+from graphformer.data import NeuronTreeDataset, get_collate_fn, LABEL_DICT
+from cv_utils import make_cv_data_dir
+
+
+def evaluate_accuracy(model, data_loader, device):
+    """Evaluate classification accuracy"""
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch in data_loader:
+            batch = batch.to(device)
+            _, logits = model(batch)
+
+            pred = logits.argmax(dim=1)
+            labels = batch.label.cuda() if not batch.label.is_cuda else batch.label
+
+            correct += (pred == labels).sum().item()
+            total += labels.size(0)
+
+    accuracy = correct / total * 100
+    model.train()
+    return accuracy
+
+
+def evaluate_classification_metrics(model, data_loader, device):
+    """Return accuracy, macro-F1, and balanced accuracy in percent."""
+    model.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for batch in data_loader:
+            batch = batch.to(device)
+            _, logits = model(batch)
+            y_true.extend(batch.label.detach().cpu().numpy().tolist())
+            y_pred.extend(logits.argmax(dim=1).detach().cpu().numpy().tolist())
+    model.train()
+    return {
+        "accuracy": float(np.mean(np.asarray(y_true) == np.asarray(y_pred)) * 100.0),
+        "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0) * 100.0),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred) * 100.0),
+    }
+
+
+def extract_features(model, data_loader, device):
+    """Extract features for KNN evaluation"""
+    model.eval()
+    features_list = []
+    labels_list = []
+
+    with torch.no_grad():
+        for batch in data_loader:
+            batch = batch.to(device)
+            _, _, features = model(batch, return_features=True)
+
+            features_list.append(features)
+            labels = batch.label.cuda() if not batch.label.is_cuda else batch.label
+            labels_list.append(labels)
+
+    features = torch.cat(features_list, dim=0)
+    labels = torch.cat(labels_list, dim=0)
+
+    model.train()
+    return features, labels
+
+
+def evaluate_knn(model, train_loader, test_loader, device, knn_k=20):
+    """KNN evaluation using sklearn"""
+    x_train, y_train = extract_features(model, train_loader, device)
+    x_test, y_test = extract_features(model, test_loader, device)
+
+    neigh = KNeighborsClassifier(n_neighbors=knn_k)
+    neigh.fit(x_train.cpu().numpy(), y_train.cpu().numpy())
+
+    score = neigh.score(x_test.cpu().numpy(), y_test.cpu().numpy())
+
+    return score * 100
+
+
+def mixup_data(features, labels, alpha=1.0):
+    """Apply mixup augmentation"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = features.size(0)
+    index = torch.randperm(batch_size).to(features.device)
+
+    mixed_features = lam * features + (1 - lam) * features[index, :]
+    labels_a, labels_b = labels, labels[index]
+
+    return mixed_features, labels_a, labels_b, lam
+
+
+def mixup_criterion(criterion, pred, labels_a, labels_b, lam):
+    """Mixup loss"""
+    return lam * criterion(pred, labels_a) + (1 - lam) * criterion(pred, labels_b)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser("GraPHFormer Fine-tuning")
+
+    # Basic
+    parser.add_argument("--work_dir", type=str, default="./work_dir")
+    parser.add_argument("--exp_name", type=str, required=True)
+    parser.add_argument("--dataset", type=str, default="bil_6_classes")
+    parser.add_argument("--data_dir", type=str, default="data/raw/bil")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--cv_fold", type=int, default=None,
+                        help="outer test fold 0..9; uses one additional fold for validation")
+    parser.add_argument("--cv_val_fold", type=int, default=None,
+                        help="validation fold; defaults to (cv_fold + 1) mod 10")
+
+    # Pretrained checkpoint
+    parser.add_argument("--pretrained_checkpoint", type=str, default=None)
+
+    # Fine-tuning mode
+    parser.add_argument("--mode", type=str, default="multimodal",
+                        choices=["image_only", "tree_only", "multimodal"])
+    parser.add_argument("--freeze_encoders", action="store_true", default=False)
+    parser.add_argument("--freeze_image_only", action="store_true", default=False)
+    parser.add_argument("--linear_probe_epochs", type=int, default=0)
+    parser.add_argument("--use_projection", action="store_true", default=False)
+    parser.add_argument("--fusion_mode", type=str, default="concat",
+                        choices=["concat", "add", "cross_attention", "bi_attention", "gated", "cmf", "mhcma"])
+
+    # Tree Model
+    parser.add_argument("--tree_model", type=str, default="double",
+                        choices=["ori", "v2", "double"])
+    parser.add_argument("--child_mode", type=str, default="sum")
+    parser.add_argument("--input_features", nargs="+", type=int,
+                        default=[2, 3, 4, 12, 13])
+    parser.add_argument("--h_size", type=int, default=256)
+    parser.add_argument("--bn", action="store_true", default=False)
+
+    # Image Model
+    parser.add_argument("--image_encoder", type=str, default="resnet18")
+    parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--freeze_image_backbone", action="store_true", default=False)
+
+    # CLIP settings
+    parser.add_argument("--embed_dim", type=int, default=128)
+    parser.add_argument("--temperature", type=float, default=0.07)
+    parser.add_argument("--loss_type", type=str, default="clip")
+
+    # Training
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--epochs", default=50, type=int)
+    parser.add_argument("--lr", default=1e-4, type=float)
+    parser.add_argument("--wd", default=0.01, type=float)
+    parser.add_argument("--warmup_epochs", type=int, default=5)
+    parser.add_argument("--start_epoch", type=int, default=0)
+    parser.add_argument("--save_freq", type=int, default=10)
+    parser.add_argument("--val_freq", type=int, default=1)
+    parser.add_argument("--gpu", default=0, type=int)
+
+    # Regularization
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--mixup_alpha", type=float, default=0.0)
+    parser.add_argument("--early_stopping_patience", type=int, default=0)
+
+    # ArcFace loss
+    parser.add_argument("--use_arcface", action="store_true", default=False)
+    parser.add_argument("--arcface_s", type=float, default=30.0)
+    parser.add_argument("--arcface_m", type=float, default=0.50)
+
+    # Augmentation
+    parser.add_argument("--aug_scale_coords", action="store_true", default=False)
+    parser.add_argument("--aug_rotate", action="store_true", default=False)
+    parser.add_argument("--aug_jitter_coords", action="store_true", default=False)
+    parser.add_argument("--aug_shift_coords", action="store_true", default=False)
+    parser.add_argument("--aug_flip", action="store_true", default=False)
+    parser.add_argument("--aug_mask_feats", action="store_true", default=False)
+    parser.add_argument("--aug_jitter_length", action="store_true", default=False)
+    parser.add_argument("--aug_elasticate", action="store_true", default=False)
+    parser.add_argument("--aug_drop_tree", action="store_true", default=False)
+    parser.add_argument("--aug_skip_parent_node", action="store_true", default=False)
+    parser.add_argument("--aug_swap_sibling_subtrees", action="store_true", default=False)
+
+    # Persistence augmentation
+    parser.add_argument("--use_persistence_aug", action="store_true", default=False)
+    parser.add_argument("--pers_translation_scale", type=float, default=0.05)
+    parser.add_argument("--pers_noise_scale", type=float, default=0.02)
+    parser.add_argument("--pers_sigma_min", type=float, default=12.0)
+    parser.add_argument("--pers_sigma_max", type=float, default=20.0)
+    parser.add_argument("--sigma_px", type=float, default=16.0)
+    parser.add_argument("--persistence_filters", type=str, default="f1,f2,f3",
+                        help="comma-separated filter names per image channel; "
+                             "e.g. 'f2' for single-channel f2 image, "
+                             "'f1,f2,f3' for the default 3-channel setup")
+    parser.add_argument("--persistence_weight", type=str, default="persistence",
+                        help="weight string ('persistence'|'radius'|'ones') or "
+                             "comma-separated per-channel weights matching "
+                             "persistence_filters length; "
+                             "论文默认三通道: --persistence_filters f1,f2,f3 "
+                             "--persistence_weight ones,persistence,radius")
+
+    # Evaluation
+    parser.add_argument("--eval_mode", type=str, default="accuracy",
+                        choices=["accuracy", "knn"])
+    parser.add_argument("--knn_k", type=int, default=20)
+
+    parser.add_argument("--cache_images", action="store_true", default=True)
+    parser.add_argument("--debug", action="store_true", default=False)
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="0 required on Windows: the collate_fn closure is not picklable")
+
+    args = parser.parse_args()
+    if args.cv_fold is not None:
+        if args.cv_fold not in range(10):
+            parser.error("--cv_fold must be in [0, 9]")
+        if args.cv_val_fold is None:
+            args.cv_val_fold = (args.cv_fold + 1) % 10
+        if args.cv_val_fold not in range(10) or args.cv_val_fold == args.cv_fold:
+            parser.error("--cv_val_fold must be in [0, 9] and differ from --cv_fold")
+        cv_data_dir = make_cv_data_dir(args.dataset, args.cv_fold, args.cv_val_fold, args.data_dir)
+    else:
+        cv_data_dir = args.data_dir
+    set_seed(args.seed)
+
+    if args.linear_probe_epochs > 0:
+        args.freeze_encoders = True
+        
+    # Setup work directory
+    args.work_dir = f"{args.work_dir}/{args.exp_name}"
+    if not os.path.exists(args.work_dir):
+        os.makedirs(args.work_dir)
+
+    # Logger
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    if args.debug:
+        log_file = None
+        args.save_freq = 10000
+        args.val_freq = 1
+    else:
+        log_file = f"{args.work_dir}/finetune_{timestamp}.log"
+    logger = get_root_logger(log_file=log_file, log_level="INFO")
+
+    logger.info("=" * 60)
+    logger.info("GraPHFormer FINE-TUNING")
+    logger.info(f"Mode: {args.mode}")
+    if args.mode == "multimodal":
+        logger.info(f"Fusion Mode: {args.fusion_mode}")
+    logger.info(f"Freeze Encoders: {args.freeze_encoders}")
+    logger.info(f"Pretrained Checkpoint: {args.pretrained_checkpoint}")
+    logger.info(f"Dataset: {args.dataset}")
+    logger.info("=" * 60)
+    logger.info(json.dumps(vars(args), indent=4, sort_keys=True))
+
+    device = torch.device("cuda")
+
+    # Load pretrained model or create from scratch
+    if args.pretrained_checkpoint is not None:
+        logger.info("=> Loading pretrained model...")
+        if not os.path.isfile(args.pretrained_checkpoint):
+            raise FileNotFoundError(f"Checkpoint not found: {args.pretrained_checkpoint}")
+
+        checkpoint = torch.load(args.pretrained_checkpoint, map_location=f"cuda:{args.gpu}")
+        state_dict = checkpoint["state_dict"]
+
+        # Auto-detect the architecture of the released checkpoint
+        if args.mode in ['image_only', 'multimodal']:
+            if "image_encoder.encoder.backbone.cls_token" in state_dict:
+                args.image_encoder = "dinov2_vits14"
+                logger.info(f"=> Detected DINOv2 image encoder")
+            # a projection head maps the backbone feature to h_size (e.g. ViT-S 384 -> 256)
+            if any(k.startswith("image_encoder.encoder.projection_head") for k in state_dict):
+                args.use_image_projection_head = True
+                logger.info("=> Detected image projection head")
+            # the DINOv2 position embedding fixes the training resolution
+            pos_key = "image_encoder.encoder.backbone.pos_embed"
+            if pos_key in state_dict:
+                n_patches = state_dict[pos_key].shape[1] - 1
+                side = int(round(n_patches ** 0.5))
+                args.image_size = side * 14
+                logger.info(f"=> Detected image_size={args.image_size} ({side}x{side} patches)")
+
+        pretrained_model = CLIPModel(args).to(device)
+
+        # match the released projection-head layout (bare Linear / one-layer Sequential)
+        if not any(k.startswith("image_projection.2") for k in state_dict):
+            feat_dim = pretrained_model.image_encoder.encoder.feat_dim
+            if any(k.startswith("image_projection.0") for k in state_dict):
+                pretrained_model.image_projection = nn.Sequential(nn.Linear(feat_dim, args.embed_dim))
+            else:
+                pretrained_model.image_projection = nn.Linear(feat_dim, args.embed_dim)
+            logger.info(f"=> Adapted image_projection head ({feat_dim} -> {args.embed_dim})")
+
+        missing_keys, unexpected_keys = pretrained_model.load_state_dict(state_dict, strict=False)
+
+        if missing_keys:
+            logger.warning(f"=> Missing keys: {len(missing_keys)}")
+        if unexpected_keys:
+            logger.warning(f"=> Unexpected keys: {len(unexpected_keys)}")
+
+        logger.info(f"=> Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+    else:
+        logger.info("=> Training from scratch")
+        pretrained_model = CLIPModel(args).to(device)
+
+    # Setup augmentations
+    aug_switchs = [
+        False,
+        args.aug_scale_coords,
+        args.aug_rotate,
+        args.aug_jitter_coords,
+        args.aug_shift_coords,
+        args.aug_flip,
+        args.aug_mask_feats,
+        args.aug_jitter_length,
+        args.aug_elasticate,
+    ]
+    aug_fns = [
+        None,
+        RandomScaleCoords(p=0.2),
+        RandomRotate(p=0.5),
+        RandomJitter(p=0.2),
+        RandomShift(p=0.2),
+        RandomFlip(p=1),
+        RandomMaskFeats(p=0.2),
+        RandomJitterLength(p=0.2),
+        RandomElasticate(p=0.2),
+    ]
+    feat_augs = [aug_fns[i] for i in range(len(aug_switchs)) if aug_switchs[i] and aug_fns[i] is not None]
+    feat_augs = Compose(feat_augs) if feat_augs else None
+
+    topo_aug_switchs = [
+        args.aug_drop_tree,
+        args.aug_skip_parent_node,
+        args.aug_swap_sibling_subtrees,
+    ]
+    topo_aug_fns = [
+        RandomDropSubTrees(probs=[0.05], max_cnt=5),
+        RandomSkipParentNode(probs=[0.05], max_cnt=10),
+        RandomSwapSiblingSubTrees(probs=[0.05], max_cnt=10),
+    ]
+    topo_augs = [topo_aug_fns[i] for i in range(len(topo_aug_switchs)) if topo_aug_switchs[i]]
+    topo_augs = Compose(topo_augs) if topo_augs else None
+
+    # Persistence augmentation
+    persistence_aug = None
+    if args.use_persistence_aug:
+        persistence_aug = CombinedPersistenceAugmentation(
+            translation_scale=args.pers_translation_scale,
+            noise_scale=args.pers_noise_scale,
+            sigma_min=args.pers_sigma_min,
+            sigma_max=args.pers_sigma_max,
+        )
+
+    # Parse per-channel filter/weight specs
+    pers_filters = tuple(s for s in args.persistence_filters.split(",") if s)
+    if "," in args.persistence_weight:
+        pers_weight = tuple(s for s in args.persistence_weight.split(",") if s)
+        assert len(pers_weight) == len(pers_filters), (
+            f"persistence_weight ({len(pers_weight)}) must match "
+            f"persistence_filters ({len(pers_filters)})")
+    else:
+        pers_weight = args.persistence_weight
+    print(f"persistence: filters={pers_filters} weight={pers_weight}", flush=True)
+
+    # Create datasets
+    collate_fn = get_collate_fn(device, use_images=True)
+
+    trainset = NeuronTreeDataset(
+        phase="train",
+        dataset=args.dataset,
+        data_dir=cv_data_dir,
+        label_dict=LABEL_DICT[args.dataset],
+        input_features=args.input_features,
+        topology_transformations=topo_augs,
+        attribute_transformations=feat_augs,
+        use_images=True,
+        image_size=args.image_size,
+        cache_images=args.cache_images,
+        persistence_augmentation=persistence_aug,
+        sigma_px=args.sigma_px,
+        persistence_filters=pers_filters,
+        persistence_weight=pers_weight,
+    )
+
+    testset = NeuronTreeDataset(
+        phase="test",
+        dataset=args.dataset,
+        data_dir=cv_data_dir,
+        label_dict=LABEL_DICT[args.dataset],
+        input_features=args.input_features,
+        use_images=True,
+        image_size=args.image_size,
+        cache_images=args.cache_images,
+        persistence_augmentation=None,
+        sigma_px=args.sigma_px,
+        persistence_filters=pers_filters,
+        persistence_weight=pers_weight,
+    )
+
+    train_loader = DataLoader(
+        dataset=trainset,
+        batch_size=args.batch_size,
+        collate_fn=collate_fn,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
+
+    test_loader = DataLoader(
+        dataset=testset,
+        batch_size=args.batch_size,
+        collate_fn=collate_fn,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+
+    val_loader = None
+    if args.cv_fold is not None:
+        valset = NeuronTreeDataset(
+            phase="val",
+            dataset=args.dataset,
+            data_dir=cv_data_dir,
+            label_dict=LABEL_DICT[args.dataset],
+            input_features=args.input_features,
+            use_images=True,
+            image_size=args.image_size,
+            cache_images=args.cache_images,
+            persistence_augmentation=None,
+            sigma_px=args.sigma_px,
+            persistence_filters=pers_filters,
+            persistence_weight=pers_weight,
+        )
+        val_loader = DataLoader(
+            dataset=valset,
+            batch_size=args.batch_size,
+            collate_fn=collate_fn,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
+
+    logger.info(f"Train samples: {len(trainset)}, Test samples: {len(testset)}")
+    logger.info(f"Number of classes: {len(trainset.classes)}")
+
+    # Create fine-tuning model
+    logger.info("=> Creating fine-tuning model...")
+    model = FineTuneModel(
+        pretrained_model=pretrained_model,
+        num_classes=len(trainset.classes),
+        mode=args.mode,
+        freeze_encoders=args.freeze_encoders,
+        fusion_mode=args.fusion_mode if args.mode == "multimodal" else None,
+        dropout=args.dropout,
+        label_smoothing=args.label_smoothing,
+        use_projection=args.use_projection,
+        use_arcface=args.use_arcface,
+        arcface_s=args.arcface_s,
+        arcface_m=args.arcface_m,
+        freeze_image_only=args.freeze_image_only
+    ).to(device)
+
+    del pretrained_model
+    logger.info(model)
+
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Total parameters: {total_params:,}")
+    logger.info(f"Trainable parameters: {trainable_params:,}")
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr,
+        weight_decay=args.wd,
+    )
+
+    cudnn.benchmark = True
+
+    # Scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=25,
+        T_mult=1,
+        eta_min=args.lr * 0.01
+    )
+
+    # Training loop
+    best_metric = 0.0
+    best_epoch = 0
+    patience_counter = 0
+    total_iters = len(train_loader) * args.epochs
+    current_iter = 0
+    start_time = time.time()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # per-epoch metrics (loss curve, wall-clock, GPU memory) for the report
+    history = []
+    history_path = f"{args.work_dir}/history.json"
+
+    logger.info("=> Starting fine-tuning...")
+    logger.info(f"=> Regularization: dropout={args.dropout}, label_smoothing={args.label_smoothing}")
+
+    for epoch in range(args.start_epoch + 1, args.epochs + 1):
+        epoch_start = time.time()
+
+        if epoch == args.linear_probe_epochs + 1 and args.linear_probe_epochs > 0:
+            logger.info("="*30)
+            logger.info(f"Linear probe phase completed. Unfreezing encoders for full fine-tuning.")
+            model.unfreeze_encoders()
+            
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info(f"Trainable parameters after unfreezing: {trainable_params:,}")
+
+            optimizer = torch.optim.AdamW(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=args.lr / 10,
+                weight_decay=args.wd,
+            )
+            logger.info(f"Optimizer reset to include unfrozen parameters with a new learning rate of {args.lr / 10}.")
+            logger.info("="*30)
+
+        model.train()
+        epoch_loss = 0.0
+        correct = 0
+        total = 0
+
+        for step, batch in enumerate(train_loader):
+            try:
+                batch = batch.to(device)
+
+                if args.mixup_alpha > 0:
+                    _, _, features = model(batch, return_features=True)
+                    labels = batch.label.cuda() if not batch.label.is_cuda else batch.label
+
+                    features, labels_a, labels_b, lam = mixup_data(features, labels, args.mixup_alpha)
+
+                    if model.use_arcface:
+                        extracted_features = model.feature_extractor(features)
+                        logits = model.arcface(extracted_features, labels)
+                        loss = model.criterion(logits, labels)
+                    else:
+                        logits = model.classifier(features)
+                        loss = mixup_criterion(model.criterion, logits, labels_a, labels_b, lam)
+                else:
+                    loss, logits = model(batch)
+
+                optimizer.zero_grad()
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                optimizer.step()
+
+                pred = logits.argmax(dim=1)
+                labels = batch.label.cuda() if not batch.label.is_cuda else batch.label
+                correct += (pred == labels).sum().item()
+                total += labels.size(0)
+
+                epoch_loss += loss.item()
+                current_iter += 1
+
+                if step % 10 == 0:
+                    current_time = time.time()
+                    elapsed = current_time - start_time
+
+                    log_str = (
+                        f"Epoch {epoch:03d} | Step {step:03d}/{len(train_loader)} | "
+                        f"Loss {loss.item():.4f} | "
+                        f"LR {optimizer.param_groups[0]['lr']:.6f} | "
+                        f"Elapsed {str(datetime.timedelta(seconds=int(elapsed)))}"
+                    )
+                    logger.info(log_str)
+            except Exception as e:
+                logger.info(f"Error in step {step}: {e}")
+                continue
+
+        scheduler.step()
+
+        avg_loss = epoch_loss / len(train_loader)
+        train_acc = correct / total * 100
+        epoch_seconds = time.time() - epoch_start
+        gpu_mb = (torch.cuda.max_memory_allocated() / 1024 ** 2) if torch.cuda.is_available() else 0.0
+        logger.info(f"Epoch {epoch:03d} | Avg Loss: {avg_loss:.4f} | Train Acc: {train_acc:.2f}% "
+                    f"| {epoch_seconds:.1f}s | GPU peak {gpu_mb:.0f}MB")
+
+        epoch_record = dict(epoch=epoch, loss=avg_loss, train_acc=train_acc,
+                            lr=optimizer.param_groups[0]["lr"],
+                            epoch_seconds=epoch_seconds, gpu_peak_mb=gpu_mb)
+
+        # Evaluation
+        if epoch % args.val_freq == 0:
+            logger.info("=> Evaluating...")
+            selection_loader = val_loader if args.cv_fold is not None else test_loader
+
+            if args.eval_mode == "accuracy":
+                selection_acc = evaluate_accuracy(model, selection_loader, device)
+                split_name = "Validation" if args.cv_fold is not None else "Test"
+                logger.info(f"  {split_name} Accuracy: {selection_acc:.2f}%")
+                metric = selection_acc
+                epoch_record[f"{split_name.lower()}_acc"] = selection_acc
+            else:
+                knn_acc = evaluate_knn(model, train_loader, selection_loader, device, args.knn_k)
+                split_name = "Validation" if args.cv_fold is not None else "Test"
+                logger.info(f"  {split_name} KNN Accuracy (k={args.knn_k}): {knn_acc:.2f}%")
+                metric = knn_acc
+                epoch_record[f"{split_name.lower()}_knn_acc"] = knn_acc
+
+            if metric > best_metric:
+                best_metric = metric
+                best_epoch = epoch
+                patience_counter = 0
+
+                checkpoint_path = f"{args.work_dir}/best_model.pth"
+                save_checkpoint(
+                    {
+                        "epoch": epoch,
+                        "state_dict": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "metric": metric,
+                        "mode": args.mode,
+                    },
+                    is_best=True,
+                    filename=checkpoint_path,
+                )
+                logger.info(f"  Saved new best checkpoint: {checkpoint_path}")
+            else:
+                patience_counter += 1
+
+            logger.info(f"  Best: {best_metric:.2f}% at epoch {best_epoch}")
+
+            if args.early_stopping_patience > 0 and patience_counter >= args.early_stopping_patience:
+                logger.info(f"  Early stopping triggered")
+                history.append(epoch_record)
+                break
+
+        history.append(epoch_record)
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+
+        # Save periodic checkpoint
+        if epoch % args.save_freq == 0:
+            checkpoint_path = f"{args.work_dir}/epoch_{epoch}.pth"
+            save_checkpoint(
+                {
+                    "epoch": epoch,
+                    "state_dict": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                },
+                is_best=False,
+                filename=checkpoint_path,
+            )
+            logger.info(f"Saved checkpoint: {checkpoint_path}")
+
+    val_best_metric = best_metric if args.cv_fold is not None else None
+    test_metrics = {}
+    if args.cv_fold is not None:
+        best_checkpoint = f"{args.work_dir}/best_model.pth"
+        if not os.path.isfile(best_checkpoint):
+            raise FileNotFoundError(f"Best validation checkpoint was not saved: {best_checkpoint}")
+        checkpoint = torch.load(best_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint["state_dict"])
+        if args.eval_mode == "accuracy":
+            test_metrics = evaluate_classification_metrics(model, test_loader, device)
+            logger.info("Outer test metrics: " + json.dumps(test_metrics))
+        else:
+            test_metrics = {"accuracy": evaluate_knn(model, train_loader, test_loader, device, args.knn_k)}
+            logger.info(f"Outer test KNN accuracy (k={args.knn_k}): {test_metrics['accuracy']:.2f}%")
+
+    total_seconds = time.time() - start_time
+    peak_mb = (torch.cuda.max_memory_allocated() / 1024 ** 2) if torch.cuda.is_available() else 0.0
+    logger.info("Fine-tuning complete!")
+    logger.info(f"Best {args.eval_mode}: {best_metric:.2f}% at epoch {best_epoch}")
+    logger.info(f"Total training time: {datetime.timedelta(seconds=int(total_seconds))} "
+                f"({total_seconds:.0f}s) | Peak GPU memory: {peak_mb:.0f}MB")
+
+    summary = dict(
+        exp_name=args.exp_name, mode=args.mode, fusion_mode=args.fusion_mode,
+        dataset=args.dataset, seed=args.seed, epochs=args.epochs,
+        batch_size=args.batch_size, lr=args.lr, temperature=args.temperature,
+        image_size=args.image_size, sigma_px=args.sigma_px,
+        use_persistence_aug=args.use_persistence_aug,
+        freeze_encoders=args.freeze_encoders,
+        pretrained_checkpoint=args.pretrained_checkpoint,
+        n_train=len(trainset), n_test=len(testset), n_classes=len(trainset.classes),
+        total_params=total_params, trainable_params=trainable_params,
+        best_metric=best_metric, val_best_metric=val_best_metric,
+        test_metrics=test_metrics, best_epoch=best_epoch, eval_mode=args.eval_mode,
+        cv_fold=args.cv_fold, cv_val_fold=args.cv_val_fold,
+        total_seconds=total_seconds, epoch_seconds_mean=float(np.mean([h["epoch_seconds"] for h in history])),
+        gpu_peak_mb=peak_mb, history=history,
+    )
+    with open(f"{args.work_dir}/summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    logger.info(f"Saved summary -> {args.work_dir}/summary.json")
